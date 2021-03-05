@@ -1,0 +1,85 @@
+--- linux-5.10.15/drivers/usb/host/xhci-ring.c	2021-02-10 09:29:23.000000000 +0100
++++ modified/xhci-ring.c	2021-02-20 18:05:50.000000000 +0100
+@@ -3483,6 +3483,7 @@
+ 	u32 field;
+ 	struct urb_priv *urb_priv;
+ 	struct xhci_td *td;
++	u32 maxp, total_packet_count;
+ 
+ 	ep_ring = xhci_urb_to_transfer_ring(xhci, urb);
+ 	if (!ep_ring)
+@@ -3501,9 +3502,14 @@
+ 	 * Don't need to check if we need additional event data and normal TRBs,
+ 	 * since data in control transfers will never get bigger than 16MB
+ 	 * XXX: can we get a buffer that crosses 64KB boundaries?
++	 *
++	 * Work-around for ASM1042 quirk: If the data size is larger than 512
++	 * bytes, create multiple chained TRBs
+ 	 */
+-	if (urb->transfer_buffer_length > 0)
+-		num_trbs++;
++	maxp = usb_endpoint_maxp(&urb->ep->desc);
++	total_packet_count = DIV_ROUND_UP(urb->transfer_buffer_length, maxp);
++	num_trbs += total_packet_count;
++
+ 	ret = prepare_transfer(xhci, xhci->devs[slot_id],
+ 			ep_index, urb->stream_id,
+ 			num_trbs, urb, 0, mem_flags);
+@@ -3547,16 +3553,12 @@
+ 		  field);
+ 
+ 	/* If there's data, queue data TRBs */
+-	/* Only set interrupt on short packet for IN endpoints */
+-	if (usb_urb_dir_in(urb))
+-		field = TRB_ISP | TRB_TYPE(TRB_DATA);
+-	else
+-		field = TRB_TYPE(TRB_DATA);
+-
+ 	if (urb->transfer_buffer_length > 0) {
+ 		u32 length_field, remainder;
+ 		u64 addr;
++		u32 to_do, pkt, pkt_len;
+ 
++		field = TRB_TYPE(TRB_DATA);
+ 		if (xhci_urb_suitable_for_idt(urb)) {
+ 			memcpy(&addr, urb->transfer_buffer,
+ 			       urb->transfer_buffer_length);
+@@ -3566,20 +3568,33 @@
+ 			addr = (u64) urb->transfer_dma;
+ 		}
+ 
+-		remainder = xhci_td_remainder(xhci, 0,
+-				urb->transfer_buffer_length,
++		to_do = urb->transfer_buffer_length;
++		for(pkt = 0; pkt < total_packet_count; pkt++) {
++			pkt_len = min(to_do, maxp);
++			remainder = xhci_td_remainder(xhci,
++					urb->transfer_buffer_length - to_do,
++					pkt_len,
+ 				urb->transfer_buffer_length,
+ 				urb, 1);
+-		length_field = TRB_LEN(urb->transfer_buffer_length) |
++			length_field = TRB_LEN(pkt_len) |
+ 				TRB_TD_SIZE(remainder) |
+ 				TRB_INTR_TARGET(0);
+-		if (setup->bRequestType & USB_DIR_IN)
+-			field |= TRB_DIR_IN;
++			if (pkt < total_packet_count - 1)
++				field |= TRB_CHAIN;
++			/* Only set interrupt on short packet for IN endpoints */
++			if (usb_urb_dir_in(urb))
++				field |= TRB_DIR_IN | TRB_ISP;
++
+ 		queue_trb(xhci, ep_ring, true,
+ 				lower_32_bits(addr),
+ 				upper_32_bits(addr),
+ 				length_field,
+ 				field | ep_ring->cycle_state);
++
++			addr += pkt_len;
++			to_do -= pkt_len;
++			field = TRB_TYPE(TRB_NORMAL);
++		}
+ 	}
+ 
+ 	/* Save the DMA address of the last TRB in the TD */
